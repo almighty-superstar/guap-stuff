@@ -1,0 +1,671 @@
+#!/bin/bash
+VERSION=".01 - build 20 - testnet only" #tcarter 
+# Simple Guap Container Control script
+now=$(date +%Y%m%d)
+logfile="./logs/$now.log"
+echo "Guap Container Control - $VERSION"
+
+if [[ ! -f ".firstrun" ]]; then
+  logit "performing setup check"
+
+  # Check if docker is running
+  if ! docker info >/dev/null 2>&1; then
+      logit  "Docker does not seem to be running, make sure it is installed and running and retry"
+      exit 1
+  fi
+
+  if ! command -v jq &> /dev/null; then
+      logit "Can't find jq. Please install jq"
+      exit
+  fi
+
+  if ! command -v curl &> /dev/null; then
+      logit "Can't find curl. Please install curl"
+      exit
+  fi
+
+  if [ ! -d logs ]; then
+    mkdir -p logs;
+  fi
+
+  if [ ! -d nodes ]; then
+    mkdir -p nodes ;
+  fi
+
+  if [ ! -d backups ]; then
+    mkdir -p backups ;
+  fi
+
+  logit "dependicies satisfied!"
+  touch .firstrun
+fi
+
+
+#todo: add command completion
+#todo: add encryption store
+#todo: add restore wallet
+#todo: borrow from here https://github.com/raininfotech/GUAP-MNScript#guide-for-install-multimn
+
+#modified https://stackoverflow.com/questions/9574089/os-x-bash-watch-command
+function watch 
+{
+   while :; do a=$($@); clear; printf "$(date)\n$a"; sleep 1;  done
+}
+
+# ref:
+# https://www.bbkane.com/blog/bash-logging-function/
+# https://unix.stackexchange.com/questions/32290/pass-command-line-arguments-to-bash-script
+
+# todo : add better logging...
+
+function logit
+{
+    # now=$(date +%Y%m%d%H%M%S)
+    now=$(date '+%Y%m%d-%H:%M:%S') 
+    echo "$now: $*" >> $logfile
+    # printf "\n$*\n"
+    echo $*
+}
+
+function is_container_running
+{
+    # comtainer_stat =  $( docker container inspect -f '{{.State.Status}}' $container ) == "running" )
+    # if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    printf "\n$*\n"
+}
+
+# ref https://unix.stackexchange.com/questions/548278/convert-unix-timestamp-to-human-readable-time
+# need portable timestamp to date 
+unix_to_iso_utc () {
+    local day_unix=$(($1 / 86400))
+    local day_offset=$(($1 % 86400))
+    local d=$(($day_unix + 719468))
+    local y=$((($d - ($d+2+3*$d/146097)/1461 + ($d-$d/146097)/36524 - ($d+1)/146097)/365))
+    local y_d=$((365*$y + $y/4 - $y/100 + $y/400))
+    local y_offset=$(($d - $y_d))
+    local m=$((($y_offset - ($y_offset+20)/50) / 30))
+    local m_d=$((30*$m + 3*($m+4)/5 - 2))
+    local day=$(($y_offset - $m_d + 1))
+    local m_cont=$((12*$y + $m + 2))
+    local year=$(($m_cont/12))
+    local month=$(($m_cont%12 + 1))
+    local hour=$(($day_offset / 3600))
+    local hour_offset=$(($day_offset % 3600))
+    local minute=$(($hour_offset / 60))
+    local second=$(($hour_offset % 60))
+    DATE=$(printf "%04d-%02d-%02dT%02d:%02d:%02d" $year $month $day $hour $minute $second)
+}
+
+help() 
+{
+  cat <<EOF
+Usage: $0 COMMAND [OPTS] dir
+Commands:
+    $0 build - build initial images from dowloaded components and bootstraped chainstate and block"
+    $0 buildsrc - from src, builds the Guap Linux Binaries guapcoin-qt, guapcoind, guapcoin-cli and guapcoin-tx
+    $0 wallet1 new (masternode,wallet,coldstake) - create new wallet1 container from wallet template
+    $0 wallet1 run - run wallet1 container
+    $0 wallet1 log - shows log tails for wallet1 container
+    $0 list - show running containers and node list
+    $0 wallet1 shell - interactive bash shell in container
+    $0 wallet1 netinfo - show ip, banned, peers, ipv4/ipv6 state
+    $0 wallet1 info - run a few informational guapoin-cli commands on container
+    $0 wallet1 help - guapcoind help
+    $0 wallet1 help getinfo - guapcoind help on getinfo
+    $0 wallet1 blockwatch - run block count updated every second\
+    $0 wallet1 backup - backup wallet from wallet1 container
+    $0 wallet1 bal - wallet1 balance
+    $0 wallet1 addresses - list wallet1 addresses
+    $0 wallet1 getnetworkinfo - run guapcoin-cli getnetworkinfo command in the container
+    $0 wallet1 mnsync status - run guapcoin-cli mnsync status command in the container
+    $0 wallet1 getinfo - run guapcoin-cli getinfo command in the container
+    $0 wallet1 getpeerinfo - run guapcoin-cli getpeerinfo command in the container
+    $0 wallet1 clearbanned - run guapcoin-cli clearbanned command in the container
+    $0 wallet1 listbanned - run guapcoin-cli listbanned command in the container
+    $0 wallet1 "args to pass to guapcoin-cli"  ex: ./gctl wallet3 "sendtoaddress tHDJ5cTjqdfxT5rdu4eYmQJFjcmsqrpzoH 500" 
+EOF
+}
+
+if [ "$1" = "list" ]; then
+  # todo: pretty this up
+  logit checking.. 
+  docker ps --filter ancestor=guap3-testnet-base
+  ls -la nodes/
+  exit 1
+fi 
+
+if [ "$1" = "mnstats" ]; then
+  logit "Getting Masternodes from explorer"  
+  curl -s http://74.208.206.109/ext/getmnlist > testnet-mn.json
+  ip=$(curl -s ipinfo.io | jq -r '.ip')
+  
+  logit "IP $ip"
+  # logit jq -r '.data[] | select(.ip == "'$ip'") |  (.ip + " " + .addr)' testnet-mn.json
+  jq -r '.data[] | select(.ip == "'$ip'") |  (.ip + " " + .addr)' testnet-mn.json
+  
+  logit "Getting Masternode Stats"
+  docker ps --filter ancestor=guap3-testnet-base --format "{{.Names}}" | xargs -I {} bash -c 'echo -n {} ; echo -n ":" ; docker exec {} guapcoin-cli getmasternodestatus | jq -r "(.message + .addr)" |  sed  "s/started/started:/g"'
+  
+  exit 0
+fi
+
+if [ "$1" = "buildsrc" ]; then
+  
+  # builds build and base images.
+  logit "Building Guap Binaries from source"
+
+  read -p "This process takes ~45 min on MacBook Pro 2.4 GHz 8-Core Intel Core i9, 32GB 2400 DDR4, Are you sure ? " -n 1 -r
+  echo    # (optional) move to a new line
+  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      exit 1  
+  fi
+
+  docker rmi guap3-testnet-src
+  time docker build --no-cache -t guap3-testnet-src -f Dockerfile-guap3-testnet-src .
+
+  printf "Run the following to get a shell \ndocker run --rm --name guap3-testnet-src -it guap3-testnet-src :latest bash\n"
+  # echo 
+  # echo mkdir  /root/.guapcoin-params
+  # echo curl -L https://github.com/PIVX-Project/PIVX/raw/master/params/sapling-output.params -o /root/.guapcoin-params/sapling-output.params
+  # echo curl -L https://github.com/PIVX-Project/PIVX/raw/master/params/sapling-spend.params  -o /root/.guapcoin-params/sapling-spend.params
+  # echo mkdir -p /root/.guapcoin/testnet5
+  # echo curl -L http://74.208.206.109/bootstrap_testnet.tar.gz -o /root/bootstrap_testnet.tar.gz
+  # echo cd /root/.guapcoin/testnet5 && tar zxvf ../bootstrap_testnet.tar.gz
+  # echo chmod -R 755 guapcoin-cli && chmod -R 755 guapcoind && mv guapcoind /usr/local/bin && mv guapcoin-cli /usr/local/bin
+  # echo ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+  # echo add a ~/root/.guapcoin/guapcon.conf file
+  exit 0
+fi
+
+
+if [ "$1" = "build" ]; then
+  
+  # builds build and base images.
+  logit "Build Guap Node container images"
+
+  # todo : check if containers based on these are already running, ask to stop them and restart after the build?
+  # if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+  #   echo "Container $container already running"
+  #   logit "Container $container already running"
+  #   exit 1
+  # else 
+  
+  if [[ "$(docker images -q guap3-testnet-build:latest 2> /dev/null)" == "" ]]; then
+    logit "image guap3-testnet-build:latest doesn't exist"
+    docker rmi guap3-testnet-base:latest
+  fi
+
+  if [[ "$(docker images -q guap3-testnet-base:latest 2> /dev/null)" == "" ]]; then
+    logit "image guap3-testnet-base:latest doesn't exist"
+    docker rmi guap3-testnet-build:latest
+  fi  
+
+  # todo : better error checking..
+  logit "Building base container"
+  docker build --no-cache -t guap3-testnet-build -f Dockerfile-guap3-testnet-build .
+  docker build --no-cache -t guap3-testnet-base -f Dockerfile-guap3-testnet-base .
+
+  # todo: if run successful, ask if we should run the container
+  # docker run --rm --name $container -it -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+  exit 0
+  # fi
+fi 
+
+# if [ $# -ne 2 ]; then
+#       help
+#       exit 1
+# fi
+
+if [ $# -eq 0 ]; then
+      help
+      exit 1
+fi
+
+DIR=$1
+CMD=$2
+container="guap3-testnet-$DIR"
+
+# echo "Container: $container"
+# echo "Command: $CMD"
+
+if [ "$CMD" = "watchtx" ]; then
+  logit "Watching transaction"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    logit "docker exec $container guapcoin-cli gettransaction $3"
+    docker exec $container guapcoin-cli gettransaction $3
+    # watch "docker exec $container guapcoin-cli gettransaction $3"
+    #set -x 
+    # watch "curl -s http://74.208.206.109/ext/gettx/142c4c26f52052c1f65efeaecc4c81d2423cd58d11cc8df8903178797b7e5919 | jq '.'"
+    #set +x 
+    exit 0
+  fi
+fi 
+
+
+if [ "$CMD" = "new" ]; then
+  # todo : handle port assignments for multinode
+
+  logit "New Container $DIR"
+  if [ -e "nodes/$DIR/guapcoin.conf"  ]; then
+    logit "Node $DIR Already exists."
+    exit 1
+  fi
+  logit "Creating new container $DIR"
+
+  nodetype=$3 
+  echo "nodetype:$nodetype"
+
+  if [ "$nodetype" = "masternode" ]; then
+    template="templates/mn"
+    cp -r "$template" "nodes/$DIR" 
+    echo  -n "Paste masternodeprivkey:"
+    read pk
+    publicip=$(curl -s ipinfo.io | jq -r '.ip')
+    sed -i .bak "s/EXIP/$publicip/g" "nodes/$DIR/guapcoin.conf" 
+    sed -i .bak "s/PKEY/$pk/g" "nodes/$DIR/guapcoin.conf" 
+
+  elif [ "$nodetype" = "coldstake" ]; then
+    template="templates/coldstake"
+    cp -r "$template" "nodes/$DIR" 
+    # https://guapcoin.org/knowledge-base/guapcoin-cold-staking-instructions/?seq_no=2
+  else
+    template="templates/wallet"
+    cp -r "$template" "nodes/$DIR" 
+    logit "cold stake node: $DIR setup complete"
+
+  fi
+
+  # exit 0 
+
+  curl -L http://74.208.206.109/bootstrap_testnet.tar.gz -o nodes/$DIR/bootstrap_testnet.tar.gz
+  # logit "Edit the config ( nodes/$DIR/guapcoin.conf ) and run it:  run %1 $DIR run"
+  # docker run --rm --name $container -it -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+  #todo ask if we want to run a blockcount watch
+  # ./gctl wallet2 getblockcount
+  # 
+  exit 1
+fi
+
+if [ ! -e "nodes/$DIR/guapcoin.conf"  ]; then
+  logit "Node $DIR Doesn't exist"
+  exit 1
+fi
+
+if [ "$CMD" = "shell" ]; then
+  logit "Running Shell"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    logit "Container $container bash"
+    docker exec -it $container bash
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+
+
+if [ "$CMD" = "netinfo" ]; then
+  
+  # todo check for jq if not found print url to help with install
+  logit "Show ip, peers, banned"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    
+    STARTED=$(docker inspect --format="{{.State.StartedAt}}" $container)
+    IP=$(docker inspect --format="{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" $container)
+    logit "IP: $IP, StartedAt: $STARTED"
+
+    logit "External IP"
+    # docker exec $container guapcoin-cli getpeerinfo | jq '.[].addrlocal' | cut -d '"' -f2 | cut -d':' -f1 | sort -u 
+    docker exec $container guapcoin-cli getpeerinfo | jq -r '.[].addrlocal' | cut -d ':' -f1 | sort -u 
+
+    logit "Nets"
+    # logit '#docker exec guapcoin-cli $container | jq -r '.networks[] | "\(.name) 'reachable:' \(.reachable)"''
+    # set +x
+    docker exec $container guapcoin-cli getnetworkinfo | jq -r '.networks[] | "\(.name) 'reachable:' \(.reachable)"'
+    # set -x
+    # ./guapcoin-cli getnetworkinfo | jq -r '.networks[] | "\(.name) 'reachable' \(.reachable)"'
+
+    logit "Peers"
+    docker exec $container guapcoin-cli getpeerinfo | jq -r '.[].addr'
+
+    logit "Banned"
+    # todo fix: jq fails if 0
+    docker exec $container guapcoin-cli listbanned | jq -r '.[] | "\(.address) \(.ban_reason)"'
+    # docker exec $container guapcoin-cli listbanned 
+
+    logit "Connection Count"
+    docker exec $container guapcoin-cli getconnectioncount 
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "addresses" ]; then
+  logit "List all addresses"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "docker exec $container guapcoin-cli listreceivedbyaddress 0 true"
+    docker exec $container guapcoin-cli listreceivedbyaddress 0 true
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "mn" ]; then
+  logit "List all addresses"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    logit "docker exec $container guapcoin-cli listmasternodes"
+    # docker exec $container guapcoin-cli listmasternodes
+    docker exec $container guapcoin-cli listmasternodes | jq -r '.[] |  (.ip + " " + .addr)' |sort 
+    # docker exec guap3-testnet-mngcp7 guapcoin-cli listmasternodes | jq 'length'
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+
+if [ "$CMD" = "blockwatch" ]; then
+  logit "Watching getblockcount"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "docker exec $container guapcoin-cli getblockcount"
+    #set -x 
+    watch "docker exec $container guapcoin-cli getblockcount"
+    #set +x 
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "log" ]; then
+  logit "Show container logs"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "docker exec $container guapcoin-cli getblockcount"
+    #set -x 
+    docker logs -f $container
+    #set +x 
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "info" ]; then
+  # todo : fix ugly output 
+  logit "Running info commands on container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+
+    logit "Balance"
+    docker exec $container guapcoin-cli getbalance
+
+    logit "Wallet Info"
+    docker exec $container guapcoin-cli getwalletinfo
+    # logit "docker exec $container guapcoin-cli getblockcount"
+    #set -x 
+    logit getblockcount in  $container
+    docker exec $container guapcoin-cli getblockcount
+    # docker exec $container guapcoin-cli getinfo
+
+    logit getblockcount from explore  74.208.206.109 
+    curl -s http://74.208.206.109/api/getblockcount;echo
+
+    logit "Is Block Synched: "
+    docker exec $container guapcoin-cli mnsync status | grep IsBlockchainSynced
+    # $(docker exec $container guapcoin-cli getnetworkinfo | grep ver)
+
+    getbestblockhash=$(docker exec $container guapcoin-cli getbestblockhash)
+    # logit $getbestblockhash
+    # docker exec $container guapcoin-cli getblock $getbestblockhash
+
+    # times=$(docker exec guap3-testnet-wallet3 guapcoin-cli getblock d47cbaaeb27a7d60e5e74de359a5f9e2e0cb17789b8f32827e689348e70b482b | jq -r '. | "\(.time) \(.mediantime)"')
+    times=$(docker exec $container guapcoin-cli getblock $getbestblockhash | jq -r '. | "\(.time);\(.mediantime)"')
+    arrtimes=(${times//;/ })
+
+    # echo ">$times<"
+    # echo ${arrtimes[0]}
+    # echo ${arrtimes[1]}
+    unix_to_iso_utc ${arrtimes[0]}
+    # echo "time $DATE"
+    blocksync="Best Block Hash: $getbestblockhash Synched: $DATE"
+    logit $blocksync
+    # unix_to_iso_utc ${arrtimes[1]}
+    # echo "mediantime $DATE"
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "resync" ]; then
+  logit "Resyncing blocks and chainstate for $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # docker stop $container
+    docker exec $container guapcoin-cli stop
+  fi
+
+  logit "Downloading bootstrap file"
+  
+  curl -L http://74.208.206.109/bootstrap_testnet.tar.gz -o nodes/$DIR/bootstrap_testnet.tar.gz
+  # cp nodes/$DIR/bootstrap_testnet.tar.gz nodes/bootstrap_testnet.tar.gz
+  # set -x 
+  cp nodes/$DIR/testnet5/wallet.dat nodes/$DIR
+  rm -rf nodes/$DIR/testnet5
+  mkdir nodes/$DIR/testnet5
+  cp nodes/$DIR/wallet.dat nodes/$DIR/testnet5
+  #tar xzvf nodes/$DIR/bootstrap_testnet.tar.gz -C nodes/$DIR/testnet5
+  #echo "PWD: $PWD"
+  #echo "DIR: $DIR"
+
+  # Temp Fix:  Blocks won't sync: temp fix: ./guapcoind -maxtipage=99999999
+  # Private testnet mining is broken in version 0.10.0 #5984
+  # https://github.com/bitcoin/bitcoin/issues/5984
+  # https://github.com/PIVX-Project/PIVX/issues/2536
+
+  cp templates/mn/start.sh nodes/$DIR/
+  docker run -d --rm --name $container -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+  exit 0
+fi 
+
+if [ "$CMD" = "restart" ]; then
+  logit "Restarting Container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    
+    docker exec $container guapcoin-cli stop
+    # todo : add loop to check if container is shutdown instead of sleep x..
+    sleep 3;
+    
+    # Temp Fix:  Blocks won't sync: temp fix: ./guapcoind -maxtipage=99999999
+    # Private testnet mining is broken in version 0.10.0 #5984
+    # https://github.com/bitcoin/bitcoin/issues/5984
+    # https://github.com/PIVX-Project/PIVX/issues/2536
+
+    # cp templates/mn/start.sh nodes/$DIR/
+
+    docker run -d --rm --name $container -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+    # todo: the above will fail if guapcoin.con server=0 is changed so 
+    # docker stop $container
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "stop" ]; then
+  logit "Stop Container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    logit "Running Docker stop container command..."
+    # docker stop $container
+    docker exec $container guapcoin-cli stop
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "stat" ]; then
+  logit "Docker Stats of Container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "Running Docker top container command..."
+    docker stats $container
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "conf" ]; then
+  logit "Edit Container Config $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "Running Docker top container command..."
+    
+    #prompt to stop container
+    echo -n "Container running, you must stop before editing the config. Stop the running container (y/n)? "
+    read answer
+
+    if [ "$answer" != "${answer#[Yy]}" ] ;then
+        logit "Stoppng Container docker stats $container"
+        docker exec $container guapcoin-cli stop
+    else
+        exit 0
+    fi
+  fi
+  
+  vi nodes/$DIR/guapcoin.conf
+  echo -n "Start $container container (y/n)? "
+  read answer
+
+  if [ "$answer" != "${answer#[Yy]}" ] ;then
+      logit "Running Container $container"
+      docker run -d --rm --name $container -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+  fi
+
+  echo -n "Show debug.logs (y/n)?"
+  read answer
+
+  if [ "$answer" != "${answer#[Yy]}" ] ;then
+      logit "Running Container $container"
+      docker logs -f $container
+  fi
+
+
+  exit 0
+  # if [ -e "nodes/$DIR/guapcoin.conf"  ]; then
+  #   logit "Node $DIR Already exists."
+  #   exit 1
+  # fi
+
+fi 
+
+
+if [ "$CMD" = "top" ]; then
+  logit "Docker Top of Container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "Running Docker top container command..."
+    docker top $container
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "bal" ]; then
+  logit "Get wallet balance of container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    # logit "Container running, executing getbalance"
+    docker exec $container guapcoin-cli getbalance
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+if [ "$CMD" = "run" ]; then
+  logit "Run container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    logit "Container $container already running"
+    exit 1
+  else 
+    logit "Running container $container"
+    # docker run --rm --name $container -it -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+    docker run -d --rm --name $container -v "$PWD/nodes/$DIR":/root/.guapcoin guap3-testnet-base:latest
+    echo -n "Show debug.logs (y/n)?"
+    read answer
+
+    if [ "$answer" != "${answer#[Yy]}" ] ;then
+        logit "Running Container $container"
+        docker logs -f $container
+    fi
+
+    exit 0
+  fi
+fi 
+
+if [ "$CMD" = "unspent" ]; then
+  logit "Calculate unspent of container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+
+    unspent=$(docker exec $container guapcoin-cli listunspent | jq '.[] | .amount')
+
+    total=0
+    for amount in $unspent; do
+      total=$(bc <<< $total+$amount);
+    done
+
+    echo "Unspent: $total"
+    docker exec $container guapcoin-cli listunspent | jq -r '.[] | .amount' | awk '{s+=$1} END {print s}'
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+
+
+if [ "$CMD" = "backup" ]; then
+  # todo : fix cp,  add encryption or warning about key in the clear..
+  # echo "fix -  copy not working"
+  # exit 1
+
+  logit "Backup container $container"
+  if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+    bufile="$DIR-backup-$(date '+%Y%m%d-%H%M%S')"
+    docker exec $container guapcoin-cli backupwallet  /root/.guapcoin/$bufile
+    sleep 5
+    ls -la $PWD/nodes/$DIR/
+    logit "cp  -v '$PWD/nodes/$DIR/$bufile' $PWD/backups/"
+    $("cp $PWD/nodes/$DIR/$bufile $PWD/backups/")
+    ls -la $PWD/backups/
+    ls -la $PWD/nodes/$DIR/
+    # rm "$PWD/nodes/$DIR/$bufile"
+    logit "Container backuped to $PWD/backups/$bufile"
+    exit 0
+  else 
+    logit "Container $container not running"
+    exit 1
+  fi
+fi 
+
+#todo : refine this ugly hack 
+logit "Running Command : " docker exec -it $container guapcoin-cli $CMD $3 $4 $5 $6 $7
+if [ "$( docker container inspect -f '{{.State.Status}}' $container )" == "running" ]; then
+  docker exec -it $container guapcoin-cli $CMD $3 $4 $5 $6 $7
+  exit 0
+else 
+  logit "Container $contaner not running"
+  exit 1
+fi
